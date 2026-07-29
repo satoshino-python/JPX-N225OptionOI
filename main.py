@@ -269,7 +269,7 @@ def save_to_bigquery(df):
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
     DATASET_ID = "jpx_options"
-    TABLE_ID = os.getenv("TABLE_NAME", "gex_daily_pivot_test")
+    TABLE_ID = os.getenv("TABLE_NAME", "gex_daily_pivot")
     TABLE_REF = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
