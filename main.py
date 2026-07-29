@@ -10,17 +10,18 @@ from google.cloud import bigquery
 
 # --- データ取得・解析ロジック ---
 
-def download_jpx_data(date_str):
-    oi_url = f"https://www.jpx.co.jp/markets/derivatives/trading-volume/tvdivq00000014nn-att/{date_str}open_interest.xlsx"
-    tp_url = f"https://www.jpx.co.jp/automation/markets/derivatives/option-price/files/ose{date_str}tp.csv"
-    settlement_url = f"https://www.jpx.co.jp/markets/derivatives/settlement-price/tvdivq00000014l6-att/rb{date_str}.csv"
+def download_jpx_data(target_date_str):
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    jst_now = utc_now + datetime.timedelta(hours=9)
+    today_str = jst_now.strftime("%Y%m%d")
     
     headers = {"User-Agent": "Mozilla/5.0"}
     df_oi, df_tp, df_settle = None, None, None
     
     # 1. 建玉情報 (Excel)
+    oi_url = f"https://www.jpx.co.jp/markets/derivatives/trading-volume/tvdivq00000014nn-att/{target_date_str}open_interest.xlsx"
     res_oi = requests.get(oi_url, headers=headers)
-    print(f"🔍 建玉データ取得 ({date_str}): ステータスコード {res_oi.status_code}")
+    print(f"🔍 建玉データ取得 ({target_date_str}): ステータスコード {res_oi.status_code}")
     if res_oi.status_code == 200:
         try:
             df_oi = pd.read_excel(BytesIO(res_oi.content), sheet_name="別紙1")
@@ -29,8 +30,9 @@ def download_jpx_data(date_str):
             print(f"  - 建玉データ (Excel) 解析失敗: {e}")
         
     # 2. オプション理論価格・IV (CSV)
+    tp_url = f"https://www.jpx.co.jp/automation/markets/derivatives/option-price/files/ose{target_date_str}tp.csv"
     res_tp = requests.get(tp_url, headers=headers)
-    print(f"🔍 理論値・価格データ取得 ({date_str}): ステータスコード {res_tp.status_code}")
+    print(f"🔍 理論値・価格データ取得 ({target_date_str}): ステータスコード {res_tp.status_code}")
     if res_tp.status_code == 200:
         try: content = res_tp.content.decode('utf-8')
         except UnicodeDecodeError: content = res_tp.content.decode('shift_jis')
@@ -40,18 +42,21 @@ def download_jpx_data(date_str):
         except Exception as e:
             print(f"  - 理論値・価格データ (CSV) 解析失敗: {e}")
         
-    # 3. 清算値・先物データ (CSV)
-    res_settle = requests.get(settlement_url, headers=headers)
-    print(f"🔍 清算値データ取得 ({date_str}): ステータスコード {res_settle.status_code}")
-    if res_settle.status_code == 200:
-        try: content = res_settle.content.decode('utf-8')
-        except UnicodeDecodeError: content = res_settle.content.decode('shift_jis')
-        try:
-            df_settle = pd.read_csv(StringIO(content), header=None)
-            print("  - 清算値データ (CSV) 読み込み成功")
-        except Exception as e:
-            print(f"  - 清算値データ (CSV) 解析失敗: {e}")
-        
+    # 3. 清算値データ (指定日付で404の場合は本日の日付でリトライ)
+    for date_candidate in [target_date_str, today_str]:
+        settlement_url = f"https://www.jpx.co.jp/markets/derivatives/settlement-price/tvdivq00000014l6-att/rb{date_candidate}.csv"
+        res_settle = requests.get(settlement_url, headers=headers)
+        print(f"🔍 清算値データ取得試行 ({date_candidate}): ステータスコード {res_settle.status_code}")
+        if res_settle.status_code == 200:
+            try: content = res_settle.content.decode('utf-8')
+            except UnicodeDecodeError: content = res_settle.content.decode('shift_jis')
+            try:
+                df_settle = pd.read_csv(StringIO(content), header=None)
+                print(f"  - 清算値データ (CSV: {date_candidate}) 読み込み成功")
+                break
+            except Exception as e:
+                print(f"  - 清算値データ (CSV) 解析失敗: {e}")
+
     return df_oi, df_tp, df_settle
 
 def extract_greeks_inputs(df_settle):
