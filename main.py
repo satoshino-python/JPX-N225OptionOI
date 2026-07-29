@@ -213,12 +213,13 @@ def fetch_latest_data():
 
 # --- BigQuery 格納処理 ---
 
+from google.cloud import bigquery
+
 def save_to_bigquery(df):
     if df.empty:
         print("⚠️ 格納するデータがありません。")
         return
 
-    # GCPプロジェクトIDとテーブル設定（適宜書き換えてください）
     PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
     DATASET_ID = "jpx_options"
     TABLE_ID = "gex_daily"
@@ -226,25 +227,21 @@ def save_to_bigquery(df):
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
 
-    # 日付パーティションの設定（data_date カラムで日毎に分割保存）
-    table_schema = [{'name': 'data_date', 'type': 'DATE'}]
-    api_config = {
-        'load': {
-            'timePartitioning': {
-                'type': 'DAY',
-                'field': 'data_date'
-            }
-        }
-    }
+    # 日付パーティションの設定（LoadJobConfig を使用）
+    job_config = bigquery.LoadJobConfig(
+        time_partitioning=bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field="data_date"  # data_date カラムで日毎にパーティション分け
+        )
+    )
 
     try:
         pandas_gbq.to_gbq(
             df,
             destination_table=TABLE_REF,
             project_id=PROJECT_ID,
-            if_exists='append',  # 既にテーブルが存在すれば末尾に追加
-            table_schema=table_schema,
-            api_config=api_config
+            if_exists='append',
+            load_job_config=job_config
         )
         print("✅ BigQueryへのデータ格納が正常に完了しました！")
     except Exception as e:
