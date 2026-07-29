@@ -1,11 +1,7 @@
-requests
 pandas
 numpy
+requests
 scipy
 openpyxl
-gspread
-google-auth
-streamlit
-plotly
-matplotlib
-japanize-matplotlib
+pandas-gbq
+google-cloud-bigquery

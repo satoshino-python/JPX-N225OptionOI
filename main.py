@@ -1,21 +1,14 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import requests
 from io import StringIO, BytesIO
 import re
 import datetime
 from scipy.stats import norm
+import os
+import pandas_gbq
 
-# ページの設定
-st.set_page_config(page_title="日経225オプション GEXダッシュボード", layout="wide")
-
-# --- main.pyのデータ処理ロジックを関数化して移植 ---
-def get_target_date():
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    jst_now = utc_now + datetime.timedelta(hours=9)
-    return jst_now.strftime("%Y%m%d")
+# --- データ取得・解析ロジック ---
 
 def download_jpx_data(date_str):
     oi_url = f"https://www.jpx.co.jp/markets/derivatives/trading-volume/tvdivq00000014nn-att/{date_str}open_interest.xlsx"
@@ -90,7 +83,6 @@ def calculate_greeks(row):
 def process_data(df_oi):
     if df_oi is None or df_oi.empty: return pd.DataFrame()
     
-    # 💡 修正箇所：確実に「当日建玉残高」に統一
     temp_columns = ["限月取引", "取引高", "当日建玉残高", "前日比", "前日建玉残高"]
     df_put = df_oi.iloc[:, [0, 1, 2, 3, 4]].copy()
     df_put.columns = temp_columns
@@ -110,7 +102,6 @@ def process_data(df_oi):
     df_combined["権利行使価格"] = extracted[2]
     df_combined = df_combined.dropna(subset=["プットコール種別", "限月", "権利行使価格"])
     
-    # 💡 修正箇所：安全に数値キャストを行うために独立した新しい DataFrame を用意
     df_clean = pd.DataFrame()
     df_clean["プットコール種別"] = df_combined["プットコール種別"]
     df_clean["限月"] = df_combined["限月"]
@@ -150,28 +141,33 @@ def process_tp_data(df_tp):
     df_res["権利行使価格"] = df_res["権利行使価格"].astype(int)
     return df_res
 
-@st.cache_data(ttl=3600)
-def load_and_calculate_all_data():
+def fetch_latest_data():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     jst_now = utc_now + datetime.timedelta(hours=9)
     df_oi_raw, df_tp_raw, df_settle_raw = None, None, None
-    confirmed_date_str = ""
+    confirmed_date = None
+    
     for i in range(5):
         target_date = jst_now - datetime.timedelta(days=i)
         date_str = target_date.strftime("%Y%m%d")
         if target_date.weekday() in [5, 6]: continue
         df_oi_raw, df_tp_raw, df_settle_raw = download_jpx_data(date_str)
         if df_oi_raw is not None and df_tp_raw is not None and df_settle_raw is not None:
-            confirmed_date_str = target_date.strftime("%Y/%m/%d")
+            confirmed_date = target_date.date()
             break
+            
     if df_oi_raw is None or df_tp_raw is None or df_settle_raw is None:
-        return pd.DataFrame(), ""
+        return pd.DataFrame()
+        
     df_greeks_inputs = extract_greeks_inputs(df_settle_raw)
     df_final_oi = process_data(df_oi_raw)
     df_final_tp = process_tp_data(df_tp_raw)
-    if df_final_oi.empty or df_final_tp.empty: return pd.DataFrame(), ""
+    
+    if df_final_oi.empty or df_final_tp.empty: return pd.DataFrame()
+    
     df_final_oi["限月"] = pd.to_numeric("20" + df_final_oi["限月"].astype(str), errors='coerce').fillna(0).astype(int)
     df_merged = pd.merge(df_final_tp, df_final_oi, on=["プットコール種別", "限月", "権利行使価格"], how="inner")
+    
     if not df_greeks_inputs.empty:
         df_merged["限月"] = df_merged["限月"].astype(int)
         df_greeks_inputs["限月"] = df_greeks_inputs["限月"].astype(int)
@@ -180,115 +176,80 @@ def load_and_calculate_all_data():
             df_merged[["デルタ", "ガンマ", "ベガ", "セータ"]] = df_merged.apply(calculate_greeks, axis=1)
             df_merged["GEX符号"] = df_merged["プットコール種別"].map({"call": 1.0, "put": -1.0})
             df_merged["GEX_raw"] = df_merged["ガンマ"] * df_merged["当日建玉残高"] * 1000 * df_merged["原資産価格_S"] * 0.01 * df_merged["GEX符号"]
-            df_merged["GEX(億円)"] = df_merged["GEX_raw"] / 100000000.0
-            return df_merged, confirmed_date_str
-    return pd.DataFrame(), ""
-
-# --- 🚀 Streamlit 画面表示フェーズ ---
-st.title("📊 日経225オプション ガンマエクスポージャー (GEX) ダッシュボード")
-
-with st.spinner("JPXから最新データを取得し、GEXを計算中..."):
-    result = load_and_calculate_all_data()
-
-if result is None or not isinstance(result, tuple) or len(result) < 2:
-    st.error("⚠️ データの初期化に失敗しました。アプリのキャッシュをクリアするか再起動してください。")
-else:
-    df_merged, data_date = result
-
-    if df_merged is None or df_merged.empty or not data_date:
-        st.error("❌ 直近5日分のデータがJPX（日本取引所グループ）側で見つかりませんでした。")
-    else:
-        unique_months = sorted(df_merged["限月"].unique())
-        options = [str(m) for m in unique_months] + ["直近3限月合計"]
-        selected_option = st.sidebar.selectbox(
-            "表示する限月を選択してください", 
-            options=options,
-            index=len(options) - 1,
-            key="gex_month_selector"
-        )
-        st.sidebar.info(f"📅 データ基準日: {data_date}")
-        
-        if selected_option == "直近3限月合計":
-            df_month = df_merged.copy()
-            title_display = "直近3限月合計"
-            underlying_price = df_merged[df_merged["限月"] == unique_months[0]]["原資産価格_S"].iloc[0]
-        else:
-            df_month = df_merged[df_merged["限月"] == int(selected_option)].copy()
-            title_display = f"{selected_option} 限月"
-            underlying_price = df_month["原資産価格_S"].iloc[0]
-
-        gex_summary = df_month.groupby("権利行使価格")["GEX(億円)"].sum().sort_index()
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("データ基準日", data_date)
-        col2.metric("基準原資産価格 (先物決済値)", f"{underlying_price:,.1f} 円")
-        col3.metric("総データ行数 (Strike数)", f"{len(gex_summary)} 行")
-
-        # 4. Plotlyによるインタラクティブなグラフ描画
-        st.subheader(f"📈 ガンマエクスポージャープロット - {title_display} ({data_date} 基準)")
-        
-        df_plot = df_month.copy()
-        df_plot["建玉残高符号"] = df_plot["プットコール種別"].map({"call": 1, "put": -1})
-        df_plot["ネット当日建玉残高"] = df_plot["当日建玉残高"] * df_plot["建玉残高符号"]
-        
-        df_grouped = df_plot.groupby("権利行使価格").agg({
-            "GEX(億円)": "sum",
-            "ガンマ": "mean",     
-            "デルタ": "mean",     
-            "ネット当日建玉残高": "sum" 
-        }).reset_index()
-        
-        df_grouped["GEX (億円×1万)"] = df_grouped["GEX(億円)"] * 10000
-        df_grouped["ガンマ (1万倍)"] = df_grouped["ガンマ"] * 10000
-        df_grouped["方向"] = df_grouped["GEX (億円×1万)"].apply(lambda x: "Call優勢 (Long Gamma)" if x >= 0 else "Put優勢 (Short Gamma)")
-        
-        import plotly.express as px
-        
-        fig = px.bar(
-            df_grouped,
-            x="権利行使価格",
-            y="GEX (億円×1万)",
-            color="方向",
-            color_discrete_map={"Call優勢 (Long Gamma)": "#1f77b4", "Put優勢 (Short Gamma)": "#d62728"},
-            labels={"権利行使価格": "権利行使価格 (Strike)", "GEX (億円×1万)": "GEX (億円 × 1万)"},
-            hover_data={
-                "権利行使価格": ":,d",
-                "GEX (億円×1万)": ":+,.0f",  
-                "ネット当日建玉残高": ":+,.0f",  
-                "デルタ": ":,.2f",
-                "ガンマ (1万倍)": ":,.2f",
-                "方向": False
+            df_merged["GEX_oku"] = df_merged["GEX_raw"] / 100000000.0
+            
+            # 💡 BigQuery用のデータ整形
+            # 日付カラムを追加（DATE型として読み込ませるため datetime.date 型に変換）
+            df_merged["data_date"] = confirmed_date
+            
+            # BigQueryのカラム名として扱いやすい英数字に変換
+            rename_map = {
+                "限月": "expiry_month",
+                "権利行使価格": "strike_price",
+                "プットコール種別": "put_call_type",
+                "理論価格": "theoretical_price",
+                "ボラティリティ": "volatility",
+                "原資産終値": "underlying_close",
+                "取引高": "volume",
+                "当日建玉残高": "open_interest",
+                "前日比": "oi_change",
+                "前日建玉残高": "prev_open_interest",
+                "原資産価格_S": "futures_settlement",
+                "金利_r": "interest_rate",
+                "残存日数_D": "days_to_expiry",
+                "デルタ": "delta",
+                "ガンマ": "gamma",
+                "ベガ": "vega",
+                "セータ": "theta",
+                "GEX符号": "gex_sign",
+                "GEX_raw": "gex_raw",
+                "GEX_oku": "gex_oku"
             }
+            df_bq = df_merged.rename(columns=rename_map)
+            return df_bq
+            
+    return pd.DataFrame()
+
+
+# --- BigQuery 格納処理 ---
+
+def save_to_bigquery(df):
+    if df.empty:
+        print("⚠️ 格納するデータがありません。")
+        return
+
+    # GCPプロジェクトIDとテーブル設定（適宜書き換えてください）
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
+    DATASET_ID = "jpx_options"
+    TABLE_ID = "gex_daily"
+    TABLE_REF = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
+
+    # 日付パーティションの設定（data_date カラムで日毎に分割保存）
+    table_schema = [{'name': 'data_date', 'type': 'DATE'}]
+    api_config = {
+        'load': {
+            'timePartitioning': {
+                'type': 'DAY',
+                'field': 'data_date'
+            }
+        }
+    }
+
+    try:
+        pandas_gbq.to_gbq(
+            df,
+            destination_table=TABLE_REF,
+            project_id=PROJECT_ID,
+            if_exists='append',  # 既にテーブルが存在すれば末尾に追加
+            table_schema=table_schema,
+            api_config=api_config
         )
-        
-        fig.update_layout(
-            xaxis_range=[underlying_price * 0.90, underlying_price * 1.10],
-            hovermode="x unified",
-            showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=20, r=20, t=30, b=20),
-            plot_bgcolor="rgba(0,0,0,0)"
-        )
-        
-        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightPink', dtick=500)
-        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-        
-        fig.add_vline(
-            x=underlying_price, 
-            line_width=2, 
-            line_dash="dash", 
-            line_color="green",
-            annotation_text=f"原資産: {underlying_price:,.0f}円",
-            annotation_position="top left"
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 5. 下部に生データテーブルを表示
-        st.subheader("📋 算出データ詳細テーブル")
-        df_month_display = df_month.copy()
-        df_month_display["GEX (億円×1万)"] = df_month_display["GEX(億円)"] * 10000
-        df_month_display["ガンマ (1万倍)"] = df_month_display["ガンマ"] * 10000
-        
-        show_cols = ["限月", "プットコール種別", "権利行使価格", "理論価格", "ボラティリティ", "当日建玉残高", "デルタ", "ガンマ (1万倍)", "GEX (億円×1万)"]
-        st.dataframe(df_month_display[show_cols].sort_values(by=["権利行使価格", "限月"]), use_container_width=True)
+        print("✅ BigQueryへのデータ格納が正常に完了しました！")
+    except Exception as e:
+        print(f"❌ BigQueryへの保存中にエラーが発生しました: {e}")
+
+if __name__ == "__main__":
+    df_to_save = fetch_latest_data()
+    save_to_bigquery(df_to_save)
