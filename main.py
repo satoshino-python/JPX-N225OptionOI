@@ -163,8 +163,12 @@ def process_tp_data(df_tp):
 def fetch_latest_data():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     jst_now = utc_now + datetime.timedelta(hours=9)
-    today_date = jst_now.date()
-    date_str = jst_now.strftime("%Y%m%d")
+
+    # テスト用：本日ではなく「1日前（昨日）」の日付を取得する
+    target_date = jst_now - datetime.timedelta(days=1)
+
+    today_date = target_date.date()
+    date_str = target_date.strftime("%Y%m%d")
     
     print(f"📅 本日の日付 (JST): {date_str}")
     
