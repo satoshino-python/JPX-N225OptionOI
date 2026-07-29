@@ -169,11 +169,9 @@ def fetch_latest_data():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     jst_now = utc_now + datetime.timedelta(hours=9)
 
-    # テスト用：本日ではなく「1日前（昨日）」の日付を取得する
-    target_date = jst_now - datetime.timedelta(days=1)
-
-    today_date = target_date.date()
-    date_str = target_date.strftime("%Y%m%d")
+    # 本日の日付（JST）を取得
+    today_date = jst_now.date()
+    date_str = jst_now.strftime("%Y%m%d")
     
     print(f"📅 本日の日付 (JST): {date_str}")
     
@@ -271,7 +269,7 @@ def save_to_bigquery(df):
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
     DATASET_ID = "jpx_options"
-    TABLE_ID = os.getenv("TABLE_NAME", "gex_daily_pivot")
+    TABLE_ID = os.getenv("TABLE_NAME", "gex_daily")
     TABLE_REF = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
