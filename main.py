@@ -4,9 +4,9 @@ import requests
 from io import StringIO, BytesIO
 import re
 import datetime
-from scipy.stats import norm
 import os
-import pandas_gbq
+from scipy.stats import norm
+from google.cloud import bigquery
 
 # --- データ取得・解析ロジック ---
 
@@ -18,24 +18,39 @@ def download_jpx_data(date_str):
     headers = {"User-Agent": "Mozilla/5.0"}
     df_oi, df_tp, df_settle = None, None, None
     
+    # 1. 建玉情報 (Excel)
     res_oi = requests.get(oi_url, headers=headers)
+    print(f"🔍 建玉データ取得 ({date_str}): ステータスコード {res_oi.status_code}")
     if res_oi.status_code == 200:
         try:
             df_oi = pd.read_excel(BytesIO(res_oi.content), sheet_name="別紙1")
-        except Exception:
-            pass
+            print("  - 建玉データ (Excel) 読み込み成功")
+        except Exception as e:
+            print(f"  - 建玉データ (Excel) 解析失敗: {e}")
         
+    # 2. オプション理論価格・IV (CSV)
     res_tp = requests.get(tp_url, headers=headers)
+    print(f"🔍 理論値・価格データ取得 ({date_str}): ステータスコード {res_tp.status_code}")
     if res_tp.status_code == 200:
         try: content = res_tp.content.decode('utf-8')
         except UnicodeDecodeError: content = res_tp.content.decode('shift_jis')
-        df_tp = pd.read_csv(StringIO(content))
+        try:
+            df_tp = pd.read_csv(StringIO(content))
+            print("  - 理論値・価格データ (CSV) 読み込み成功")
+        except Exception as e:
+            print(f"  - 理論値・価格データ (CSV) 解析失敗: {e}")
         
+    # 3. 清算値・先物データ (CSV)
     res_settle = requests.get(settlement_url, headers=headers)
+    print(f"🔍 清算値データ取得 ({date_str}): ステータスコード {res_settle.status_code}")
     if res_settle.status_code == 200:
         try: content = res_settle.content.decode('utf-8')
         except UnicodeDecodeError: content = res_settle.content.decode('shift_jis')
-        df_settle = pd.read_csv(StringIO(content), header=None)
+        try:
+            df_settle = pd.read_csv(StringIO(content), header=None)
+            print("  - 清算値データ (CSV) 読み込み成功")
+        except Exception as e:
+            print(f"  - 清算値データ (CSV) 解析失敗: {e}")
         
     return df_oi, df_tp, df_settle
 
@@ -61,7 +76,9 @@ def extract_greeks_inputs(df_settle):
             "残存日数_D": df_filtered["調整残存日数"].astype(int)
         })
         return df_inputs.drop_duplicates(subset=["限月"]).reset_index(drop=True)
-    except Exception: return pd.DataFrame()
+    except Exception as e:
+        print(f"  - ギリシャ指標入力値抽出エラー: {e}")
+        return pd.DataFrame()
 
 def calculate_greeks(row):
     S, K, D, v = row["原資産価格_S"], row["権利行使価格"], row["残存日数_D"], row["ボラティリティ"]
@@ -125,6 +142,8 @@ def process_tp_data(df_tp):
     df_filtered["原資産終値"] = pd.to_numeric(df_filtered["原資産終値"], errors='coerce')
     target_months = sorted(df_filtered["限月"].dropna().unique())[:3]
     df_filtered = df_filtered[df_filtered["限月"].isin(target_months)]
+    
+    if df_filtered.empty: return pd.DataFrame()
     underlying = df_filtered["原資産終値"].iloc[0]
     df_filtered = df_filtered[(df_filtered["権利行使価格"] >= underlying * 0.85) & (df_filtered["権利行使価格"] <= underlying * 1.15)]
     
@@ -144,26 +163,26 @@ def process_tp_data(df_tp):
 def fetch_latest_data():
     utc_now = datetime.datetime.now(datetime.timezone.utc)
     jst_now = utc_now + datetime.timedelta(hours=9)
-    df_oi_raw, df_tp_raw, df_settle_raw = None, None, None
-    confirmed_date = None
+    today_date = jst_now.date()
+    date_str = jst_now.strftime("%Y%m%d")
     
-    for i in range(5):
-        target_date = jst_now - datetime.timedelta(days=i)
-        date_str = target_date.strftime("%Y%m%d")
-        if target_date.weekday() in [5, 6]: continue
-        df_oi_raw, df_tp_raw, df_settle_raw = download_jpx_data(date_str)
-        if df_oi_raw is not None and df_tp_raw is not None and df_settle_raw is not None:
-            confirmed_date = target_date.date()
-            break
-            
+    print(f"📅 本日の日付 (JST): {date_str}")
+    
+    df_oi_raw, df_tp_raw, df_settle_raw = download_jpx_data(date_str)
+    
     if df_oi_raw is None or df_tp_raw is None or df_settle_raw is None:
+        print(f"⚠️ 本日 ({date_str}) のデータがJPX側で未公開、または一部のファイルが取得できませんでした。")
         return pd.DataFrame()
         
     df_greeks_inputs = extract_greeks_inputs(df_settle_raw)
     df_final_oi = process_data(df_oi_raw)
     df_final_tp = process_tp_data(df_tp_raw)
     
-    if df_final_oi.empty or df_final_tp.empty: return pd.DataFrame()
+    print(f"📊 データ加工結果 - OI行数: {len(df_final_oi)}, TP行数: {len(df_final_tp)}, Inputs行数: {len(df_greeks_inputs)}")
+    
+    if df_final_oi.empty or df_final_tp.empty:
+        print("❌ 前処理後のデータが空になりました。")
+        return pd.DataFrame()
     
     df_final_oi["限月"] = pd.to_numeric("20" + df_final_oi["限月"].astype(str), errors='coerce').fillna(0).astype(int)
     df_merged = pd.merge(df_final_tp, df_final_oi, on=["プットコール種別", "限月", "権利行使価格"], how="inner")
@@ -172,17 +191,18 @@ def fetch_latest_data():
         df_merged["限月"] = df_merged["限月"].astype(int)
         df_greeks_inputs["限月"] = df_greeks_inputs["限月"].astype(int)
         df_merged = pd.merge(df_merged, df_greeks_inputs, on=["限月"], how="inner")
+        
         if not df_merged.empty:
+            # ギリシャ指標および GEX の計算
             df_merged[["デルタ", "ガンマ", "ベガ", "セータ"]] = df_merged.apply(calculate_greeks, axis=1)
             df_merged["GEX符号"] = df_merged["プットコール種別"].map({"call": 1.0, "put": -1.0})
             df_merged["GEX_raw"] = df_merged["ガンマ"] * df_merged["当日建玉残高"] * 1000 * df_merged["原資産価格_S"] * 0.01 * df_merged["GEX符号"]
             df_merged["GEX_oku"] = df_merged["GEX_raw"] / 100000000.0
             
-            # 💡 BigQuery用のデータ整形
-            # 日付カラムを追加（DATE型として読み込ませるため datetime.date 型に変換）
-            df_merged["data_date"] = confirmed_date
+            # 日付カラムを追加
+            df_merged["data_date"] = today_date
             
-            # BigQueryのカラム名として扱いやすい英数字に変換
+            # BigQuery用カラム名変換
             rename_map = {
                 "限月": "expiry_month",
                 "権利行使価格": "strike_price",
@@ -205,21 +225,19 @@ def fetch_latest_data():
                 "GEX_raw": "gex_raw",
                 "GEX_oku": "gex_oku"
             }
+            
             df_bq = df_merged.rename(columns=rename_map)
             return df_bq
             
+    print("❌ ギリシャ指標計算・マージ後のデータが空になりました。")
     return pd.DataFrame()
 
 
 # --- BigQuery 格納処理 ---
 
-from google.cloud import bigquery
-
-from google.cloud import bigquery
-
 def save_to_bigquery(df):
     if df.empty:
-        print("⚠️ 格納するデータがありません。")
+        print("⚠️ 格納するデータが存在しません（処理をスキップします）。")
         return
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
@@ -229,14 +247,10 @@ def save_to_bigquery(df):
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
 
-    # BigQueryクライアントの初期化
     client = bigquery.Client(project=PROJECT_ID)
 
-    # ロードジョブの設定（日付パーティションの指定）
     job_config = bigquery.LoadJobConfig(
-        # 既存テーブルがあれば追加保存
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        # data_date カラムで日毎にパーティション分け
         time_partitioning=bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY,
             field="data_date"
@@ -244,16 +258,14 @@ def save_to_bigquery(df):
     )
 
     try:
-        # DataFrameを直接BigQueryテーブルへロード
         job = client.load_table_from_dataframe(
             df, TABLE_REF, job_config=job_config
         )
-        # 完了まで待機
-        job.result()
+        job.result()  # 完了待機
         print("✅ BigQueryへのデータ格納が正常に完了しました！")
     except Exception as e:
         print(f"❌ BigQueryへの保存中にエラーが発生しました: {e}")
-    
+
 if __name__ == "__main__":
     df_to_save = fetch_latest_data()
     save_to_bigquery(df_to_save)
