@@ -215,6 +215,8 @@ def fetch_latest_data():
 
 from google.cloud import bigquery
 
+from google.cloud import bigquery
+
 def save_to_bigquery(df):
     if df.empty:
         print("⚠️ 格納するデータがありません。")
@@ -227,26 +229,31 @@ def save_to_bigquery(df):
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
 
-    # 日付パーティションの設定（LoadJobConfig を使用）
+    # BigQueryクライアントの初期化
+    client = bigquery.Client(project=PROJECT_ID)
+
+    # ロードジョブの設定（日付パーティションの指定）
     job_config = bigquery.LoadJobConfig(
+        # 既存テーブルがあれば追加保存
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        # data_date カラムで日毎にパーティション分け
         time_partitioning=bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY,
-            field="data_date"  # data_date カラムで日毎にパーティション分け
+            field="data_date"
         )
     )
 
     try:
-        pandas_gbq.to_gbq(
-            df,
-            destination_table=TABLE_REF,
-            project_id=PROJECT_ID,
-            if_exists='append',
-            load_job_config=job_config
+        # DataFrameを直接BigQueryテーブルへロード
+        job = client.load_table_from_dataframe(
+            df, TABLE_REF, job_config=job_config
         )
+        # 完了まで待機
+        job.result()
         print("✅ BigQueryへのデータ格納が正常に完了しました！")
     except Exception as e:
         print(f"❌ BigQueryへの保存中にエラーが発生しました: {e}")
-
+    
 if __name__ == "__main__":
     df_to_save = fetch_latest_data()
     save_to_bigquery(df_to_save)
