@@ -236,7 +236,27 @@ def fetch_latest_data():
             }
             
             df_bq = df_merged.rename(columns=rename_map)
-            return df_bq
+            
+            # --- ストライクごとの横持ち（ピボット集計）処理 ---
+            df_bq['call_oi'] = np.where(df_bq['put_call_type'] == 'call', df_bq['open_interest'], 0)
+            df_bq['put_oi'] = np.where(df_bq['put_call_type'] == 'put', df_bq['open_interest'], 0)
+            df_bq['call_gex_oku'] = np.where(df_bq['put_call_type'] == 'call', df_bq['gex_oku'], 0)
+            df_bq['put_gex_oku'] = np.where(df_bq['put_call_type'] == 'put', df_bq['gex_oku'], 0)
+
+            group_cols = ['data_date', 'expiry_month', 'strike_price', 'underlying_close', 'futures_settlement', 'interest_rate', 'days_to_expiry']
+            df_grouped = df_bq.groupby(group_cols, as_index=False).agg({
+                'call_oi': 'sum',
+                'put_oi': 'sum',
+                'volume': 'sum',
+                'call_gex_oku': 'sum',
+                'put_gex_oku': 'sum',
+                'gex_oku': 'sum'  # ネットGEX (Call GEX + Put GEX)
+            })
+
+            df_grouped['net_open_interest'] = df_grouped['call_oi'] - df_grouped['put_oi']
+            df_grouped = df_grouped.rename(columns={'gex_oku': 'net_gex_oku'})
+
+            return df_grouped
             
     print("❌ ギリシャ指標計算・マージ後のデータが空になりました。")
     return pd.DataFrame()
@@ -251,7 +271,7 @@ def save_to_bigquery(df):
 
     PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
     DATASET_ID = "jpx_options"
-    TABLE_ID = "gex_daily"
+    TABLE_ID = os.getenv("TABLE_NAME", "gex_daily_pivot")
     TABLE_REF = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     print(f"🚀 BigQuery ({TABLE_REF}) へデータを書き込み中... 基準日: {df['data_date'].iloc[0]}")
